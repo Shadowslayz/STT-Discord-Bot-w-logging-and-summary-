@@ -8,7 +8,6 @@ from typing import Optional, List
 
 import discord
 from discord.ext import tasks, commands
-from discord import app_commands
 
 from dotenv import load_dotenv
 from vosk import Model, KaldiRecognizer
@@ -48,7 +47,33 @@ intents.message_content = True
 intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-tree = bot.tree
+
+# ========= STARTUP SANITY PRINTS =========
+def _startup_sanity():
+    print(f"[startup] discord version: {getattr(discord, '__version__', 'unknown')}")
+    print(f"[startup] discord module : {getattr(discord, '__file__', 'unknown')}")
+    try:
+        import nacl
+        print(f"[startup] PyNaCl: {nacl.__version__}")
+    except Exception as e:
+        print(f"[startup] PyNaCl import FAILED: {e}")
+
+    # Sinks availability check (Py-Cord exposes either discord.ext.sinks or discord.sinks)
+    global sinks_mod, HAVE_SINKS
+    sinks_mod = None
+    HAVE_SINKS = False
+    try:
+        from discord.ext import sinks as _s
+        sinks_mod = _s
+        HAVE_SINKS = True
+        print("[startup] sinks via discord.ext.sinks: OK")
+    except Exception:
+        if hasattr(discord, "sinks"):
+            sinks_mod = discord.sinks  # type: ignore[attr-defined]
+            HAVE_SINKS = True
+            print("[startup] sinks via discord.sinks: OK")
+        else:
+            print("[startup] sinks NOT FOUND. Recording will be disabled.")
 
 # ========= GLOBALS / STATE =========
 stt_model: Optional[Model] = None
@@ -95,7 +120,7 @@ def get_guild_cfg(guild_id: int) -> dict:
         guild_config[str(guild_id)] = g
     return g
 
-def channel_allowed(inter: discord.Interaction) -> bool:
+def channel_allowed(inter: discord.ApplicationContext) -> bool:
     g = get_guild_cfg(inter.guild.id)
     allowed_id = g.get("text_channel_id")
     return (allowed_id is None) or (inter.channel.id == allowed_id)
@@ -149,6 +174,23 @@ def wav_bytes_to_text(wav_bytes: bytes) -> str:
         return data.get("text", "").strip()
     except Exception:
         return ""
+async def maybe_defer(inter, *, ephemeral=False):
+    # If we might take >2–3s, defer once
+    if not getattr(inter, "responded", False):
+        try:
+            await inter.defer(ephemeral=ephemeral)
+        except Exception as e:
+            print(f"[defer warn] {e}")
+
+async def safe_reply(inter, content, *, ephemeral=False):
+    # Reply once; subsequent messages go to followup
+    try:
+        if getattr(inter, "responded", False):
+            await inter.followup.send(content, ephemeral=ephemeral)
+        else:
+            await inter.respond(content, ephemeral=ephemeral)
+    except Exception as e:
+        print(f"[reply error] {e}")
 
 def speaker_name(member: discord.Member, use_nick: bool) -> str:
     return member.display_name if (use_nick and getattr(member, "display_name", None)) else member.name
@@ -172,24 +214,49 @@ def read_log_lines(path: str, max_lines: int = MAX_LOG_LINES_TO_SUMMARIZE) -> Li
         lines = f.readlines()
     return lines[-max_lines:] if len(lines) > max_lines else lines
 
-async def ensure_in_user_voice(inter: discord.Interaction, target_vc: Optional[discord.VoiceChannel]) -> Optional[discord.VoiceClient]:
+async def ensure_in_user_voice(inter: discord.ApplicationContext,
+                               target_vc: Optional[discord.VoiceChannel]) -> Optional[discord.VoiceClient]:
+    # choose user's VC if none provided
     if target_vc is None:
         if inter.user and isinstance(inter.user, discord.Member) and inter.user.voice and inter.user.voice.channel:
             target_vc = inter.user.voice.channel
         else:
-            await inter.response.send_message("Join a voice channel or pass one to `/join`.", ephemeral=True)
+            # don't reply here; let caller handle messaging
             return None
 
-    if inter.guild.voice_client and inter.guild.voice_client.is_connected():
-        if inter.guild.voice_client.channel.id != target_vc.id:
-            await inter.guild.voice_client.move_to(target_vc)
-        return inter.guild.voice_client
+    # already connected in this guild?
+    vc = inter.guild.voice_client
+    if vc and vc.is_connected():
+        try:
+            if vc.channel.id != target_vc.id:
+                await vc.move_to(target_vc)
+            return vc
+        except Exception as e:
+            print(f"[ensure_in_user_voice] move_to error: {e}")
 
-    return await target_vc.connect(cls=discord.VoiceClient)
+    # try to connect (no extra kwargs for py-cord 2.x)
+    try:
+        vc = await target_vc.connect()
+        return vc
+    except discord.ClientException as e:
+        # race: we connected between check and connect()
+        if "Already connected" in str(e):
+            return inter.guild.voice_client
+        raise
 
-# ========= RECORDING LOOP (Py-Cord sinks) =========
+
+
+# ========= RECORDING LOOP (sinks compatibility) =========
+# sinks_mod is set in _startup_sanity()
+sinks_mod = None
+HAVE_SINKS = False
+
 async def _start_recording(vc: discord.VoiceClient, guild: discord.Guild):
-    sink = discord.sinks.WaveSink()
+    if not HAVE_SINKS or sinks_mod is None:
+        log_line(guild.id, "[recording disabled]: sinks module not available in this discord install.")
+        return
+
+    sink = sinks_mod.WaveSink()
 
     def finished_callback(sink, *args):
         g = get_guild_cfg(guild.id)
@@ -211,7 +278,7 @@ async def _start_recording(vc: discord.VoiceClient, guild: discord.Guild):
         return
 
     await asyncio.sleep(CHUNK_SECONDS)
-    if vc.recording:
+    if getattr(vc, "recording", False):
         vc.stop_recording()
 
 @tasks.loop(seconds=2.0)
@@ -263,42 +330,15 @@ def summarize_text_with_openai(lines: List[str], date_str: str, guild_name: str)
 @bot.event
 async def on_ready():
     load_config()
+    _startup_sanity()
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
     print("Guilds I'm in:")
     for g in bot.guilds:
         print(f"- {g.name} (ID: {g.id})")
-
-    # Instant: copy global commands into each guild & sync
-    try:
-        print("Commands discovered at import:", [c.name for c in tree.get_commands()])
-        total = 0
-        for g in bot.guilds:
-            guild_obj = discord.Object(id=g.id)
-            tree.copy_global_to(guild=guild_obj)
-            synced = await tree.sync(guild=guild_obj)
-            print(f"✅ Synced {len(synced)} commands to guild {g.id} ({g.name})")
-            total += len(synced)
-        if total == 0:
-            print("ℹ️ Still 0? Then your decorators didn’t execute.")
-    except Exception as e:
-        print(f"❌ Guild sync failed: {e}")
-
     recorder_loop.start()
 
-# ========= ADMIN: sync here on demand =========
-@tree.command(name="sync_here", description="Admin: sync slash commands to THIS server")
-@app_commands.default_permissions(administrator=True)
-async def sync_here(inter: discord.Interaction):
-    try:
-        guild_obj = discord.Object(id=inter.guild.id)
-        tree.copy_global_to(guild=guild_obj)
-        synced = await tree.sync(guild=guild_obj)
-        await inter.response.send_message(f"✅ Synced {len(synced)} commands to this guild.", ephemeral=True)
-    except Exception as e:
-        await inter.response.send_message(f"❌ Sync failed here: {e}", ephemeral=True)
-
-# ========= SLASH COMMANDS (GLOBAL definitions) =========
-def _block_if_busy(inter: discord.Interaction) -> bool:
+# ========= HELPERS =========
+def _block_if_busy(inter: discord.ApplicationContext) -> bool:
     if ACTIVE_GUILD_ID is None:
         return False
     if ACTIVE_GUILD_ID == inter.guild_id:
@@ -307,28 +347,35 @@ def _block_if_busy(inter: discord.Interaction) -> bool:
         return False
     return True
 
-# Claim/release
-@tree.command(name="claim", description="Claim the bot for this server (single active server).")
-@app_commands.default_permissions(manage_guild=True)
-async def claim(inter: discord.Interaction):
+# ========= SLASH COMMANDS (Py-Cord) =========
+
+@bot.slash_command(
+    name="claim",
+    description="Claim the bot for this server (single active server).",
+    default_member_permissions=discord.Permissions(manage_guild=True)
+)
+async def claim(inter: discord.ApplicationContext):
     if not channel_allowed(inter):
-        await inter.response.send_message("This command is restricted to the configured text channel.", ephemeral=True)
+        await inter.respond("This command is restricted to the configured text channel.", ephemeral=True)
         return
     global ACTIVE_GUILD_ID
     if ACTIVE_GUILD_ID is None or session_claimable():
         touch_activity(inter.guild.id)
-        await inter.response.send_message(f"✅ Session claimed for **{inter.guild.name}** (idle timeout {SESSION_TIMEOUT_SECONDS//60} min).")
+        await inter.respond(f"✅ Session claimed for **{inter.guild.name}** (idle timeout {SESSION_TIMEOUT_SECONDS//60} min).")
     elif ACTIVE_GUILD_ID == inter.guild.id:
         touch_activity(inter.guild.id)
-        await inter.response.send_message("✅ You already own the session; refreshed the timer.")
+        await inter.respond("✅ You already own the session; refreshed the timer.")
     else:
-        await inter.response.send_message(busy_message(), ephemeral=True)
+        await inter.respond(busy_message(), ephemeral=True)
 
-@tree.command(name="release", description="Release this server's claim so another server can use the bot.")
-@app_commands.default_permissions(manage_guild=True)
-async def release(inter: discord.Interaction):
+@bot.slash_command(
+    name="release",
+    description="Release this server's claim so another server can use the bot.",
+    default_member_permissions=discord.Permissions(manage_guild=True)
+)
+async def release(inter: discord.ApplicationContext):
     if not channel_allowed(inter):
-        await inter.response.send_message("This command is restricted to the configured text channel.", ephemeral=True)
+        await inter.respond("This command is restricted to the configured text channel.", ephemeral=True)
         return
     if ACTIVE_GUILD_ID in (None, inter.guild_id) or session_claimable():
         if inter.guild.voice_client and getattr(inter.guild.voice_client, "recording", False):
@@ -336,74 +383,119 @@ async def release(inter: discord.Interaction):
         if inter.guild.voice_client and inter.guild.voice_client.is_connected():
             await inter.guild.voice_client.disconnect()
         release_session()
-        await inter.response.send_message("🟢 Session released. Any server can now `/claim` or `/join`.")
+        await inter.respond("🟢 Session released. Any server can now `/claim` or `/join`.")
     else:
-        await inter.response.send_message(busy_message(), ephemeral=True)
+        await inter.respond(busy_message(), ephemeral=True)
 
-# Config commands
-@tree.command(name="settext", description="Restrict bot replies to a specific text channel.")
-@app_commands.default_permissions(manage_guild=True)
-async def settext(inter: discord.Interaction, channel: discord.TextChannel):
+@bot.slash_command(
+    name="settext",
+    description="Restrict bot replies to a specific text channel.",
+    default_member_permissions=discord.Permissions(manage_guild=True)
+)
+async def settext(
+    inter: discord.ApplicationContext,
+    channel: discord.Option(discord.TextChannel, "Text channel", required=True)
+):
     g = get_guild_cfg(inter.guild.id)
     g["text_channel_id"] = channel.id
     save_config()
     touch_activity(inter.guild.id)
-    await inter.response.send_message(f"✅ I’ll only respond in {channel.mention} now. Use `/cleartext` to remove restriction.")
+    await inter.respond(f"✅ I’ll only respond in {channel.mention} now. Use `/cleartext` to remove restriction.")
 
-@tree.command(name="cleartext", description="Remove text-channel restriction.")
-@app_commands.default_permissions(manage_guild=True)
-async def cleartext(inter: discord.Interaction):
+@bot.slash_command(
+    name="cleartext",
+    description="Remove text-channel restriction.",
+    default_member_permissions=discord.Permissions(manage_guild=True)
+)
+async def cleartext(inter: discord.ApplicationContext):
     g = get_guild_cfg(inter.guild.id)
     g["text_channel_id"] = None
     save_config()
     touch_activity(inter.guild.id)
-    await inter.response.send_message("✅ Text-channel restriction cleared.")
+    await inter.respond("✅ Text-channel restriction cleared.")
 
-@tree.command(name="setvoice", description="Set the preferred voice channel.")
-@app_commands.default_permissions(manage_guild=True)
-async def setvoice(inter: discord.Interaction, channel: discord.VoiceChannel):
+@bot.slash_command(
+    name="setvoice",
+    description="Set the preferred voice channel.",
+    default_member_permissions=discord.Permissions(manage_guild=True)
+)
+async def setvoice(
+    inter: discord.ApplicationContext,
+    channel: discord.Option(discord.VoiceChannel, "Voice channel", required=True)
+):
     g = get_guild_cfg(inter.guild.id)
     g["voice_channel_id"] = channel.id
     save_config()
     touch_activity(inter.guild.id)
-    await inter.response.send_message(f"✅ Preferred voice channel set to **{channel.name}**.")
+    await inter.respond(f"✅ Preferred voice channel set to **{channel.name}**.")
 
-# nicknames with explicit choices
-@tree.command(name="nicknames", description="Use server nicknames in logs on/off.")
-@app_commands.default_permissions(manage_guild=True)
-@app_commands.choices(
-    mode=[
-        app_commands.Choice(name="on", value="on"),
-        app_commands.Choice(name="off", value="off"),
-    ]
+@bot.slash_command(
+    name="nicknames",
+    description="Use server nicknames in logs on/off.",
+    default_member_permissions=discord.Permissions(manage_guild=True)
 )
-async def nicknames(inter: discord.Interaction, mode: app_commands.Choice[str]):
+async def nicknames(
+    inter: discord.ApplicationContext,
+    mode: discord.Option(str, "on or off", choices=["on", "off"])
+):
     g = get_guild_cfg(inter.guild.id)
-    g["use_nicknames"] = (mode.value == "on")
+    g["use_nicknames"] = (mode == "on")
     save_config()
     touch_activity(inter.guild.id)
-    await inter.response.send_message(f"✅ Use nicknames: **{g['use_nicknames']}**")
+    await inter.respond(f"✅ Use nicknames: **{g['use_nicknames']}**")
 
-# Voice/session commands
-@tree.command(name="join", description="Join your current voice channel or a specified one.")
-async def join(inter: discord.Interaction, channel: Optional[discord.VoiceChannel] = None):
+@bot.slash_command(name="join", description="Join your current voice channel or a specified one.")
+async def join(
+    inter: discord.ApplicationContext,
+    channel: discord.Option(discord.VoiceChannel, description="Voice channel to join", required=False) = None
+):
+    # acknowledge immediately so the spinner stops
+    await inter.defer(ephemeral=True)
+
+    # quick guards that return fast
     if not channel_allowed(inter):
-        await inter.response.send_message("This command is restricted to the configured text channel.", ephemeral=True)
+        await inter.followup.send("This command is restricted to the configured text channel.", ephemeral=True)
         return
     if _block_if_busy(inter):
-        await inter.response.send_message(busy_message(), ephemeral=True)
+        await inter.followup.send(busy_message(), ephemeral=True)
         return
-    touch_activity(inter.guild.id)
-    vc_target = channel or None
-    vc = await ensure_in_user_voice(inter, vc_target)
-    if vc:
-        await inter.response.send_message(f"Joined **{vc.channel.name}**.")
 
-@tree.command(name="leave", description="Leave voice and stop logging.")
-async def leave(inter: discord.Interaction):
+    # pick a target channel (user’s current VC if none provided)
+    target_vc = channel
+    if target_vc is None:
+        member = inter.user if isinstance(inter.user, discord.Member) else None
+        if not (member and member.voice and member.voice.channel):
+            await inter.followup.send("Join a voice channel or pass one to `/join`.", ephemeral=True)
+            return
+        target_vc = member.voice.channel
+
+    try:
+        vc = inter.guild.voice_client
+        if vc and vc.is_connected():
+            # already connected somewhere → move if different
+            if vc.channel.id != target_vc.id:
+                await vc.move_to(target_vc)
+            msg = f"Already connected; moved to **{target_vc.name}**." if vc.channel.id != target_vc.id else f"Already in **{target_vc.name}**."
+        else:
+            # not connected → connect
+            vc = await target_vc.connect()  # no self_deaf kwarg on your version
+            msg = f"Joined **{vc.channel.name}**."
+
+        touch_activity(inter.guild.id)
+        await inter.followup.send(msg, ephemeral=True)
+
+    except discord.ClientException as e:
+        # e.g., “Already connected to a voice channel.”
+        await inter.followup.send(f"⚠️ {e}", ephemeral=True)
+    except Exception as e:
+        await inter.followup.send(f"❌ Failed to join: `{e}`", ephemeral=True)
+
+
+@bot.slash_command(name="leave", description="Leave voice and stop logging.")
+async def leave(inter: discord.ApplicationContext):
     global is_logging
     if not channel_allowed(inter):
-        await inter.response.send_message("This command is restricted to the configured text channel.", ephemeral=True)
+        await inter.respond("This command is restricted to the configured text channel.", ephemeral=True)
         return
     is_logging = False
     if inter.guild.voice_client:
@@ -413,61 +505,80 @@ async def leave(inter: discord.Interaction):
         except Exception:
             pass
         await inter.guild.voice_client.disconnect()
-        await inter.response.send_message("Left voice channel and stopped logging.")
+        await inter.respond("Left voice channel and stopped logging.")
     else:
-        await inter.response.send_message("I'm not in a voice channel.", ephemeral=True)
+        await inter.respond("I'm not in a voice channel.", ephemeral=True)
     touch_activity(inter.guild.id)
 
-@tree.command(name="startlog", description=f"Start STT logging (chunks={CHUNK_SECONDS}s).")
-async def startlog(inter: discord.Interaction):
+@bot.slash_command(name="startlog", description=f"Start STT logging (chunks={CHUNK_SECONDS}s).")
+async def startlog(inter: discord.ApplicationContext):
     global is_logging
     if not channel_allowed(inter):
-        await inter.response.send_message("This command is restricted to the configured text channel.", ephemeral=True)
+        await inter.respond("This command is restricted to the configured text channel.", ephemeral=True)
         return
     if _block_if_busy(inter):
-        await inter.response.send_message(busy_message(), ephemeral=True)
+        await inter.respond(busy_message(), ephemeral=True)
         return
     if not inter.guild.voice_client or not inter.guild.voice_client.is_connected():
-        await inter.response.send_message("I'm not connected to a voice channel. Use `/join` first.", ephemeral=True)
+        await inter.respond("I'm not connected to a voice channel. Use `/join` first.", ephemeral=True)
         return
+
+    # NEW: preflight checks
+    problems = []
+    if not HAVE_SINKS:
+        problems.append("sinks module not available (install py-cord 2.6.0 with voice; sinks should be present).")
+    if not os.path.isdir(MODEL_PATH):
+        problems.append(f"Vosk model folder not found: `{MODEL_PATH}`")
+    if not os.path.isfile(AudioSegment.converter):
+        problems.append(f"ffmpeg not found at `{AudioSegment.converter}`")
+    if not os.path.isfile(AudioSegment.ffprobe):
+        problems.append(f"ffprobe not found at `{AudioSegment.ffprobe}`")
+
+    if problems:
+        await inter.respond("❌ Can’t start logging:\n- " + "\n- ".join(problems), ephemeral=True)
+        return
+
     touch_activity(inter.guild.id)
     is_logging = True
     dt = datetime.utcnow().strftime("%Y-%m-%d")
-    await inter.response.send_message(f"✅ Logging started. Appending to `logs/{inter.guild.id}-{dt}.log` (UTC).")
+    await inter.respond(f"✅ Logging started. Appending to `logs/{inter.guild.id}-{dt}.log` (UTC).")
 
-@tree.command(name="stoplog", description="Stop STT logging.")
-async def stoplog(inter: discord.Interaction):
+@bot.slash_command(name="stoplog", description="Stop STT logging.")
+async def stoplog(inter: discord.ApplicationContext):
     global is_logging
     if not channel_allowed(inter):
-        await inter.response.send_message("This command is restricted to the configured text channel.", ephemeral=True)
+        await inter.respond("This command is restricted to the configured text channel.", ephemeral=True)
         return
     if _block_if_busy(inter):
-        await inter.response.send_message(busy_message(), ephemeral=True)
+        await inter.respond(busy_message(), ephemeral=True)
         return
     is_logging = False
     if inter.guild.voice_client and getattr(inter.guild.voice_client, "recording", False):
         inter.guild.voice_client.stop_recording()
-    await inter.response.send_message("⏹️ Logging stopped.")
+    await inter.respond("⏹️ Logging stopped.")
     touch_activity(inter.guild.id)
 
-@tree.command(name="logfile", description="Show today's log filename.")
-async def logfile(inter: discord.Interaction):
+@bot.slash_command(name="logfile", description="Show today's log filename.")
+async def logfile(inter: discord.ApplicationContext):
     if not channel_allowed(inter):
-        await inter.response.send_message("This command is restricted to the configured text channel.", ephemeral=True)
+        await inter.respond("This command is restricted to the configured text channel.", ephemeral=True)
         return
     dt = datetime.utcnow().strftime("%Y-%m-%d")
     path = log_path_for_date(inter.guild.id, dt)
-    await inter.response.send_message(f"`{path}`")
+    await inter.respond(f"`{path}`")
     touch_activity(inter.guild.id)
 
-@tree.command(name="summarize", description="Summarize transcript with GPT.")
-@app_commands.describe(scope="today | yesterday | date | last", value="YYYY-MM-DD for date, or N for last")
-async def summarize(inter: discord.Interaction, scope: str = "today", value: Optional[str] = None):
+@bot.slash_command(name="summarize", description="Summarize transcript with GPT.")
+async def summarize(
+    inter: discord.ApplicationContext,
+    scope: discord.Option(str, "today | yesterday | date | last", choices=["today","yesterday","date","last"]) = "today",
+    value: discord.Option(str, "YYYY-MM-DD for date, or N for last", required=False) = None
+):
     if not channel_allowed(inter):
-        await inter.response.send_message("This command is restricted to the configured text channel.", ephemeral=True)
+        await inter.respond("This command is restricted to the configured text channel.", ephemeral=True)
         return
     if _block_if_busy(inter):
-        await inter.response.send_message(busy_message(), ephemeral=True)
+        await inter.respond(busy_message(), ephemeral=True)
         return
 
     from datetime import datetime as _dt
@@ -481,42 +592,41 @@ async def summarize(inter: discord.Interaction, scope: str = "today", value: Opt
         date_utc = date_utc - timedelta(days=1)
     elif scope == "date":
         if not value or not re.match(r"^\d{4}-\d{2}-\d{2}$", value):
-            await inter.response.send_message("Provide `value=YYYY-MM-DD` when scope=`date`.", ephemeral=True)
+            await inter.respond("Provide `value=YYYY-MM-DD` when scope=`date`.", ephemeral=True)
             return
         try:
             date_utc = _dt.strptime(value, "%Y-%m-%d").date()
         except ValueError:
-            await inter.response.send_message("Invalid date format. Use YYYY-MM-DD.", ephemeral=True)
+            await inter.respond("Invalid date format. Use YYYY-MM-DD.", ephemeral=True)
             return
     elif scope == "last":
         if not value or not value.isdigit():
-            await inter.response.send_message("Provide `value=N` (e.g., 250) when scope=`last`.", ephemeral=True)
+            await inter.respond("Provide `value=N` (e.g., 250) when scope=`last`.", ephemeral=True)
             return
         last_n = max(1, min(int(value), MAX_LOG_LINES_TO_SUMMARIZE))
     else:
-        await inter.response.send_message("scope must be one of: today, yesterday, date, last", ephemeral=True)
+        await inter.respond("scope must be one of: today, yesterday, date, last", ephemeral=True)
         return
 
     date_str = date_utc.strftime("%Y-%m-%d")
     path = log_path_for_date(inter.guild.id, date_str)
     lines = read_log_lines(path, max_lines=MAX_LOG_LINES_TO_SUMMARIZE)
     if not lines:
-        await inter.response.send_message(f"No transcript found for **{date_str}**.", ephemeral=True)
+        await inter.respond(f"No transcript found for **{date_str}**.", ephemeral=True)
         return
     if last_n is not None:
         lines = lines[-last_n:]
 
-    await inter.response.send_message("🧠 Summarizing…", ephemeral=True)
+    await inter.respond("🧠 Summarizing…", ephemeral=True)
     summary = summarize_text_with_openai(lines, date_str, inter.guild.name) or "No summary produced."
-    # chunk to avoid 2000-char limit
     while summary:
         chunk = summary[:1900]
         summary = summary[1900:]
         await inter.followup.send(chunk)
     touch_activity(inter.guild.id)
 
-@tree.command(name="status", description="Show current settings and session owner.")
-async def status(inter: discord.Interaction):
+@bot.slash_command(name="status", description="Show current settings and session owner.")
+async def status(inter: discord.ApplicationContext):
     g = get_guild_cfg(inter.guild.id)
     tchan = inter.guild.get_channel(g.get("text_channel_id")) if g.get("text_channel_id") else None
     vchan = inter.guild.get_channel(g.get("voice_channel_id")) if g.get("voice_channel_id") else None
@@ -535,7 +645,7 @@ async def status(inter: discord.Interaction):
         f"**Active server:** {('None' if owner is None else f'{owner}')} "
         + ("" if remaining is None else f"(idle timeout in ~{remaining//60}m {remaining%60}s)")
     ]
-    await inter.response.send_message("\n".join(msg), ephemeral=True)
+    await inter.respond("\n".join(msg), ephemeral=True)
 
 # ========= RUN =========
 if __name__ == "__main__":
