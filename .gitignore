@@ -1,0 +1,23 @@
+
+---
+
+### 📄 **.gitignore**
+```gitignore
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+.venv/
+.env
+
+# Config & secrets
+config.py
+
+# Logs
+logs/
+*.log
+
+# Models (too large to track)
+models/
