@@ -1,17 +1,16 @@
 import os
+import io
 import discord
 from discord import app_commands
 from openai import OpenAI
 from datetime import datetime, timezone
 from dotenv import load_dotenv
-from config import DISCORDTOKEN, OPENAPIAPIKEY, GUILD_ID as CONFIG_GUILD_ID
+from config import DISCORDTOKEN, OPENAPIAPIKEY
 
 # ---------- CONFIG ----------
 load_dotenv()
 DISCORD_TOKEN = DISCORDTOKEN
 OPENAI_API_KEY = OPENAPIAPIKEY
-# Prefer GUILD_ID from .env, else from config.py
-GUILD_ID = int(os.getenv("GUILD_ID", CONFIG_GUILD_ID if CONFIG_GUILD_ID else "0"))
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -34,7 +33,22 @@ system_prompt = (
     "6) Participation Stats."
 )
 
-# ---------- Summarization Function ----------
+# ---------- Chunking Helper ----------
+def chunk_text(text, max_chars=6000):
+    """Split transcript into smaller chunks under max_chars each."""
+    chunks, current = [], []
+    length = 0
+    for line in text.splitlines():
+        if length + len(line) > max_chars:
+            chunks.append("\n".join(current))
+            current, length = [], 0
+        current.append(line)
+        length += len(line)
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+# ---------- Summarization ----------
 def summarize_text(text: str) -> str:
     try:
         resp = client.chat.completions.create(
@@ -49,23 +63,34 @@ def summarize_text(text: str) -> str:
     except Exception as e:
         return f"⚠️ Error while summarizing: {e}"
 
+def summarize_large_transcript(full_transcript: str) -> str:
+    # 1. Break transcript into chunks
+    chunks = chunk_text(full_transcript)
+
+    # 2. Summarize each chunk
+    chunk_summaries = []
+    for i, chunk in enumerate(chunks, 1):
+        summary = summarize_text(chunk)
+        chunk_summaries.append(f"--- Chunk {i} ---\n{summary}")
+
+    # 3. Combine summaries into one and do a "summary of summaries"
+    combined = "\n\n".join(chunk_summaries)
+    final_summary = summarize_text("These are summaries of transcript chunks:\n\n" + combined)
+
+    return final_summary
+
 # ---------- Events ----------
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
     try:
-        if GUILD_ID:
-            guild = discord.Object(id=GUILD_ID)
-            synced = await tree.sync(guild=guild)  # instant sync for your test guild
-            print(f"✅ Synced {len(synced)} command(s) to guild {GUILD_ID}")
-        else:
-            synced = await tree.sync()  # global sync (takes up to 1h)
-            print(f"✅ Synced {len(synced)} global command(s)")
+        synced = await tree.sync()  # global sync
+        print(f"✅ Synced {len(synced)} global command(s)")
     except Exception as e:
         print(f"⚠️ Failed to sync commands: {e}")
 
 # ---------- Slash Command ----------
-@tree.command(name="summarize", description="Summarize today's SeaVoice logs into meeting notes", guild=discord.Object(id=GUILD_ID) if GUILD_ID else None)
+@tree.command(name="summarize", description="Summarize today's SeaVoice logs into meeting notes")
 async def summarize(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
 
@@ -96,9 +121,20 @@ async def summarize(interaction: discord.Interaction):
         return
 
     full_transcript = "\n".join(messages)
-    summary = summarize_text(full_transcript)
+    summary = summarize_large_transcript(full_transcript)
 
-    await interaction.followup.send(f"📋 **Meeting Summary (Today):**\n{summary}")
+    # ✅ If summary is too long, send as a file
+    if len(summary) > 2000:
+        file = discord.File(
+            io.BytesIO(summary.encode("utf-8")),
+            filename=f"meeting_summary_{now.strftime('%Y-%m-%d')}.txt"
+        )
+        await interaction.followup.send(
+            content="📋 **Meeting Summary (Today):** Attached as file (too long for chat).",
+            file=file
+        )
+    else:
+        await interaction.followup.send(f"📋 **Meeting Summary (Today):**\n{summary}")
 
 # ---------- RUN ----------
 bot.run(DISCORD_TOKEN)
